@@ -57,6 +57,7 @@ class pyBlock:
         self.vols = []  # The list of volumes (pySpline volume)
         self.nVol = None  # The total number of volumessurfaces
         self.coef = None  # The global (reduced) set of control pts
+        self.periodic = kwargs.get("periodic", None)
         self.embeddedVolumes = {}
         self.symmPlane = symmPlane
         if volBounds is None:
@@ -370,7 +371,7 @@ class pyBlock:
             for iface in range(6):
                 coords[ivol, 20 + iface] = self.vols[ivol].getMidPointFace(iface)
 
-        self.topo = BlockTopology(coords, nodeTol=nodeTol, edgeTol=edgeTol)
+        self.topo = BlockTopology(coords, nodeTol=nodeTol, edgeTol=edgeTol, periodic=self.periodic)
         sizes = []
         for ivol in range(self.nVol):
             sizes.append([self.vols[ivol].nCtlu, self.vols[ivol].nCtlv, self.vols[ivol].nCtlw])

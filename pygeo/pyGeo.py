@@ -80,6 +80,7 @@ class pyGeo:
         self.nSurf = None  # The total number of surfaces
         self.coef = None  # The global (reduced) set of control
         # points
+        self.periodic = kwargs.get("periodic", None)
 
         if initType == "plot3d":
             self._readPlot3D(*args, **kwargs)
@@ -87,14 +88,260 @@ class pyGeo:
             self._readIges(*args, **kwargs)
         elif initType == "liftingSurface":
             self._init_lifting_surface(*args, **kwargs)
+        elif initType == "duct":
+            self._init_duct_surface(*args, **kwargs)
         elif initType == "create":  # Don't do anything
             pass
         else:
-            raise Error("Unknown init type. Valid Init types are 'plot3d', 'iges' and 'liftingSurface'")
+            raise Error("Unknown init type. Valid Init types are 'plot3d', 'iges', 'liftingSurface' and 'duct'")
 
     # ----------------------------------------------------------------------------
     #               Initialization Type Functions
     # ----------------------------------------------------------------------------
+
+    def _init_duct_surface(
+        self,
+        xsections,
+        X=None,
+        x=None,
+        y=None,
+        z=None,
+        rot=None,
+        rotX=None,
+        rotY=None,
+        rotZ=None,
+        scale=None,
+        offset=None,
+        nCtl=None,
+        kSpan=3,
+        thickness=None,
+    ):
+        """Create a duct surface by distributing the cross
+        sections in a closed loop.
+        """
+
+        if X is not None:
+            Xsec = np.array(X)
+        else:
+            # We have to use x, y, z
+            Xsec = np.vstack([x, y, z]).T
+
+        N = len(Xsec)
+
+        # For a duct, we MUST have at least 3 sections to form a loop
+        # and we will automatically close it.
+        # If the user provided N sections, and periodic is True,
+        # we might want to append the first section to the end if it's not already there.
+
+        # Check if first and last are same
+        if np.allclose(Xsec[0], Xsec[-1]) and xsections[0] == xsections[-1]:
+            # Already closed
+            is_closed = True
+        else:
+            # Not closed, we will close it
+            Xsec = np.vstack([Xsec, Xsec[0]])
+            xsections = list(xsections) + [xsections[0]]
+            if scale is not None:
+                scale = np.append(scale, scale[0])
+            if offset is not None:
+                offset = np.vstack([offset, offset[0]])
+            if rot is not None:
+                rot = np.vstack([rot, rot[0]])
+            if rotX is not None:
+                rotX = np.append(rotX, rotX[0])
+            if rotY is not None:
+                rotY = np.append(rotY, rotY[0])
+            if rotZ is not None:
+                rotZ = np.append(rotZ, rotZ[0])
+            if thickness is not None:
+                thickness = np.append(thickness, thickness[0])
+            N = len(Xsec)
+            is_closed = True
+
+        # Set periodic flag for topology
+        self.periodic = [False, True]  # Periodic in V (circumferential)
+
+        # Now we can use most of the logic from lifting surface
+        # but without the tip and TE logic (ducts are usually smooth loops)
+
+        if rot is not None:
+            rot = np.array(rot)
+        else:
+            if rotX is None:
+                rotX = np.zeros(N)
+            if rotY is None:
+                rotY = np.zeros(N)
+            if rotZ is None:
+                rotZ = np.zeros(N)
+            rot = np.vstack([rotX, rotY, rotZ]).T
+
+        if offset is None:
+            offset = np.zeros((N, 2))
+
+        if scale is None:
+            scale = np.ones(N)
+
+        # Load in and fit them all
+        curves = []
+        knots = []
+        for i in range(len(xsections)):
+            if xsections[i] is not None:
+                x, y = geo_utils.readAirfoilFile(xsections[i])
+                if nCtl is not None:
+                    c = Curve(x=x, y=y, nCtl=nCtl, k=4)
+                else:
+                    c = Curve(x=x, y=y, localInterp=True)
+
+                curves.append(c)
+                knots.append(c.t)
+            else:
+                curves.append(None)
+
+        # Blend knot vectors
+        if nCtl is not None:
+            newKnots = geo_utils.blendKnotVectors(knots, True)
+            for i in range(len(xsections)):
+                if curves[i] is not None:
+                    curves[i].t = newKnots.copy()
+                    curves[i].recompute(100, computeKnots=False)
+        else:
+            # Same knot insertion logic as lifting surface
+            origKnots = [None for i in range(N)]
+            for i in range(N):
+                if curves[i] is not None:
+                    origKnots[i] = curves[i].t.copy()
+
+            baseKnots = []
+            baseKnots.extend(origKnots[0])
+            for i in range(1, N):
+                if curves[i] is not None:
+                    knots = origKnots[i]
+                    indices = np.searchsorted(baseKnots, knots, side="left")
+                    toInsert = []
+                    for j in range(len(indices)):
+                        if abs(baseKnots[indices[j]] - knots[j]) > 1e-12:
+                            toInsert.append(knots[j])
+                    baseKnots.extend(toInsert)
+                    baseKnots.sort()
+
+            newKnots = []
+            mult = []
+            i = 0
+            Nmax = len(baseKnots)
+            while i < len(baseKnots):
+                curKnot = baseKnots[i]
+                j = 1
+                while i + j < Nmax and abs(baseKnots[i + j] - curKnot) < 1e-12:
+                    j += 1
+                i += j
+                newKnots.append(curKnot)
+                mult.append(j)
+
+            for i in range(N):
+                if curves[i] is not None:
+                    for j in range(len(newKnots)):
+                        if newKnots[j] not in curves[i].t:
+                            curves[i].insertKnot(newKnots[j], mult[j])
+            for i in range(len(xsections)):
+                if curves[i] is not None:
+                    curves[i].t = curves[0].t.copy()
+            newKnots = curves[0].t.copy()
+
+        # Circumferential curve (Xcurve)
+        # For a duct, this should be periodic if we want C2 continuity
+        # But pyspline Curve doesn't easily do periodic from points yet?
+        # We'll use a standard curve for now, and the topology will weld the ends.
+        Xcurve = Curve(X=Xsec, k=kSpan)
+
+        # Scale thickness if requested
+        if thickness is not None:
+            thickness = np.atleast_1d(thickness)
+            if len(thickness) == 1:
+                thickness = np.ones(N) * thickness
+            for i in range(N):
+                curves[i].coef[1:-1, 1] *= thickness[i]
+
+        # Split into inner and outer walls
+        # For a duct, "Upper" becomes "Outer" and "Lower" becomes "Inner"
+        topCurves = []
+        botCurves = []
+        uSplit = curves[0].t[(curves[0].nCtl + 4 - 1) // 2]
+
+        for i in range(len(xsections)):
+            c1, c2 = curves[i].splitCurve(uSplit)
+            topCurves.append(c1)
+            c2.reverse()
+            botCurves.append(c2)
+
+        # Symmetrize knots
+        knotsTop = topCurves[0].t.copy()
+        knotsBot = botCurves[0].t.copy()
+        eps = 1e-12
+        for i in range(len(knotsTop)):
+            found = False
+            for j in range(len(knotsBot)):
+                if abs(knotsTop[i] - knotsBot[j]) < eps:
+                    found = True
+            if not found:
+                for ii in range(len(xsections)):
+                    botCurves[ii].insertKnot(knotsTop[i], 1)
+        for i in range(len(knotsBot)):
+            found = False
+            for j in range(len(knotsTop)):
+                if abs(knotsBot[i] - knotsTop[j]) < eps:
+                    found = True
+            if not found:
+                for ii in range(len(xsections)):
+                    topCurves[ii].insertKnot(knotsBot[i], 1)
+
+        for i in range(len(xsections)):
+            topCurves[i].t = topCurves[0].t.copy()
+            botCurves[i].t = topCurves[0].t.copy()
+
+        ncoef = topCurves[0].nCtl
+        coefTop = np.zeros((ncoef, len(xsections), 3))
+        coefBot = np.zeros((ncoef, len(xsections), 3))
+
+        for i in range(len(xsections)):
+            coefTop[:, i, 0] = scale[i] * (topCurves[i].coef[:, 0] - offset[i, 0])
+            coefTop[:, i, 1] = scale[i] * (topCurves[i].coef[:, 1] - offset[i, 1])
+            coefTop[:, i, 2] = 0
+            coefBot[:, i, 0] = scale[i] * (botCurves[i].coef[:, 0] - offset[i, 0])
+            coefBot[:, i, 1] = scale[i] * (botCurves[i].coef[:, 1] - offset[i, 1])
+            coefBot[:, i, 2] = 0
+
+            for j in range(ncoef):
+                coefTop[j, i, :] = geo_utils.rotzV(coefTop[j, i, :], rot[i, 2] * np.pi / 180)
+                coefTop[j, i, :] = geo_utils.rotxV(coefTop[j, i, :], rot[i, 0] * np.pi / 180)
+                coefTop[j, i, :] = geo_utils.rotyV(coefTop[j, i, :], rot[i, 1] * np.pi / 180)
+                coefBot[j, i, :] = geo_utils.rotzV(coefBot[j, i, :], rot[i, 2] * np.pi / 180)
+                coefBot[j, i, :] = geo_utils.rotxV(coefBot[j, i, :], rot[i, 0] * np.pi / 180)
+                coefBot[j, i, :] = geo_utils.rotyV(coefBot[j, i, :], rot[i, 1] * np.pi / 180)
+
+            coefTop[:, i, :] += Xsec[i, :]
+            coefBot[:, i, :] += Xsec[i, :]
+
+        self.surfs.append(Surface(coef=coefTop, ku=4, kv=kSpan, tu=topCurves[0].t, tv=Xcurve.t))
+        self.surfs.append(Surface(coef=coefBot, ku=4, kv=kSpan, tu=botCurves[0].t, tv=Xcurve.t))
+
+        self.nSurf = len(self.surfs)
+
+        # Cheat data for connectivity
+        u = np.linspace(0, 1, 3)
+        v = np.linspace(0, 1, 3)
+        [V, U] = np.meshgrid(u, v)
+        for i in range(self.nSurf):
+            self.surfs[i].origData = True
+            self.surfs[i].X = self.surfs[i](U, V)
+            self.surfs[i].Nu = 3
+            self.surfs[i].Nv = 3
+
+        self._calcConnectivity(1e-6, 1e-6)
+        sizes = []
+        for isurf in range(self.nSurf):
+            sizes.append([self.surfs[isurf].nCtlu, self.surfs[isurf].nCtlv])
+        self.topo.calcGlobalNumbering(sizes)
+        self.setSurfaceCoef()
 
     def _readPlot3D(self, fileName, order="f", ku=4, kv=4, nCtlu=4, nCtlv=4):
         """Load a plot3D file and create the splines to go with each patch
@@ -876,7 +1123,7 @@ class pyGeo:
             beg, mid, end = self.surfs[isurf].getOrigValuesEdge(3)
             coords[isurf][7] = mid
 
-        self.topo = SurfaceTopology(coords=coords, nodeTol=nodeTol, edgeTol=edgeTol)
+        self.topo = SurfaceTopology(coords=coords, nodeTol=nodeTol, edgeTol=edgeTol, periodic=self.periodic)
 
     def printConnectivity(self):
         """
